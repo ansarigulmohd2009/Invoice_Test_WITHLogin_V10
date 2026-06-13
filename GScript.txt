@@ -1,0 +1,416 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  G.M. ENTERPRISES — Google Apps Script Backend
+//  Handles: Login, Invoice CRUD, Challan CRUD, Buyer CRUD, Dashboard Data
+//  Sheets used: Users | Invoices | Challans | Buyers
+// ════════════════════════════════════════════════════════════════════════════
+
+function doGet(e) {
+  try {
+    var action = e.parameter.action;
+    var ss     = SpreadsheetApp.getActiveSpreadsheet();
+    
+    // Auto-create missing sheets on first run
+    setupSheets(ss);
+
+    // ── 1. LOGIN ─────────────────────────────────────────────────────────────
+    if (action === 'checkLogin') {
+      var username  = (e.parameter.username || '').trim().toLowerCase();
+      var password  = (e.parameter.password || '').trim();
+      var userSheet = ss.getSheetByName('Users');
+      
+      var numRows = userSheet.getLastRow();
+      if (numRows <= 1) {
+        return jsonOut({ success: false, message: 'No users found in database.' });
+      }
+
+      var usersData = userSheet.getRange(2, 1, numRows - 1, 3).getValues();
+      for (var i = 0; i < usersData.length; i++) {
+        var dbUser   = String(usersData[i][0]).trim().toLowerCase();
+        var dbPass   = String(usersData[i][1]).trim();
+        var fullName = String(usersData[i][2]).trim();
+
+        if (dbUser === username && dbPass === password) {
+          return jsonOut({ success: true, username: dbUser, displayName: fullName });
+        }
+      }
+      return jsonOut({ success: false, message: 'Invalid username or password.' });
+    }
+
+    // ── 2. GET INVOICE NUMBERS (for auto-increment) ───────────────────────────
+    if (action === 'getInvoiceNos') {
+      var sheet = ss.getSheetByName('Invoices');
+      if (!sheet || sheet.getLastRow() <= 1) {
+        return jsonOut({ invoiceNos: [] });
+      }
+
+      var numRows    = sheet.getLastRow() - 1;
+      var rawValues  = sheet.getRange(2, 2, numRows, 1).getValues();
+      var invoiceNos = rawValues
+        .map(function(row) { return String(row[0]).trim(); })
+        .filter(function(v) { return v.length > 0; });
+
+      return jsonOut({ invoiceNos: invoiceNos });
+    }
+
+    // ── 3. GET CHALLAN NUMBERS (for auto-increment in main app) ──────────────
+    if (action === 'getChallans') {
+      var sheet = ss.getSheetByName('Challans');
+      if (!sheet || sheet.getLastRow() <= 1) {
+        return jsonOut({ challans: [] });
+      }
+
+      var numRows    = sheet.getLastRow() - 1;
+      var rawValues  = sheet.getRange(2, 2, numRows, 1).getValues(); // Column B = Challan No
+      var challans = rawValues
+        .map(function(row) { return { id: String(row[0]).trim() }; })
+        .filter(function(v) { return v.id.length > 0; });
+
+      return jsonOut({ challans: challans });
+    }
+
+    // ── 4. GET FULL CHALLAN DATA (for Reports page) ───────────────────────────
+    if (action === 'getChallansData') {
+      var sheet = ss.getSheetByName('Challans');
+      if (!sheet || sheet.getLastRow() <= 1) {
+        return jsonOut({ challans: [] });
+      }
+
+      var numRows = sheet.getLastRow() - 1;
+      // Columns: A=Timestamp, B=ChallanNo, C=Date, D=RefInvoiceNo, E=Company,
+      //          F=Buyer, G=BuyerPhone, H=BuyerEmail, I=SubTotal, J=Tax,
+      //          K=GrandTotal, L=ItemDescriptions, M=HSNCodes, N=Quantities,
+      //          O=Rates, P=ItemAmounts, Q=ItemsJSON, R=SavedBy
+      var data = sheet.getRange(2, 1, numRows, 18).getValues();
+      var challans = [];
+
+      for (var i = 0; i < data.length; i++) {
+        var row = data[i];
+        if (!row[1] && !row[5]) continue; // Skip blank rows
+
+        var rawDate = row[2];
+        var dateStr = '';
+        if (rawDate instanceof Date && !isNaN(rawDate)) {
+          dateStr = Utilities.formatDate(rawDate, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+        } else if (typeof rawDate === 'string' && rawDate.trim()) {
+          dateStr = rawDate.trim();
+        }
+
+        challans.push({
+          challanNo:    String(row[1]  || '').trim(),
+          date:         dateStr,
+          refInvoiceNo: String(row[3]  || '').trim(),
+          company:      String(row[4]  || '').trim(),
+          buyerName:    String(row[5]  || '').trim(),
+          buyerPhone:   String(row[6]  || '').trim(),
+          buyerEmail:   String(row[7]  || '').trim(),
+          subTotal:     parseFloat(row[8])  || 0,
+          taxAmount:    parseFloat(row[9])  || 0,
+          grandTotal:   parseFloat(row[10]) || 0,
+          items:        String(row[16] || '[]').trim(),
+          itemCount:    countItems(String(row[11] || '')),
+          username:     String(row[17] || '').trim()
+        });
+      }
+      return jsonOut({ challans: challans });
+    }
+
+    // ── 5. SEARCH & GET BUYERS ────────────────────────────────────────────────
+    if (action === 'searchBuyer' || action === 'getBuyers') {
+      var query = (e.parameter.q || '').toLowerCase().trim();
+      var sheet = ss.getSheetByName('Buyers');
+
+      if (!sheet || sheet.getLastRow() <= 1) {
+        return jsonOut({ buyers: [] });
+      }
+
+      var numRows = sheet.getLastRow() - 1;
+      var data    = sheet.getRange(2, 1, numRows, 9).getValues();
+      var matches = [];
+
+      for (var i = 0; i < data.length; i++) {
+        var name = String(data[i][1] || '').trim();
+        if (query === '' || name.toLowerCase().indexOf(query) !== -1) {
+          matches.push({
+            name:      name,
+            address:   String(data[i][2] || '').trim(),
+            gstin:     String(data[i][3] || '').trim(),
+            state:     String(data[i][4] || '').trim(),
+            stateCode: String(data[i][5] || '').trim(),
+            phone:     String(data[i][6] || '').trim(),
+            email:     String(data[i][7] || '').trim()
+          });
+        }
+      }
+
+      // De-duplicate by name
+      var seen = {};
+      matches.forEach(function(b) { seen[b.name] = b; });
+      return jsonOut({ buyers: Object.values(seen) });
+    }
+
+    // ── 6. DASHBOARD DATA (Invoices) ──────────────────────────────────────────
+    if (action === 'getDashboard') {
+      var sheet = ss.getSheetByName('Invoices');
+      if (!sheet || sheet.getLastRow() <= 1) {
+        return jsonOut({ invoices: [] });
+      }
+
+      var numRows = sheet.getLastRow() - 1;
+      var data = sheet.getRange(2, 1, numRows, 18).getValues();
+      var invoices = [];
+
+      for (var i = 0; i < data.length; i++) {
+        var row = data[i];
+        if (!row[1] && !row[5]) continue; // Skip blank rows
+
+        var rawDate = row[2];
+        var dateStr = '';
+        if (rawDate instanceof Date && !isNaN(rawDate)) {
+          dateStr = Utilities.formatDate(rawDate, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+        } else if (typeof rawDate === 'string' && rawDate.trim()) {
+          dateStr = rawDate.trim();
+        }
+
+        invoices.push({
+          invoiceNo:  String(row[1]  || '').trim(),
+          date:       dateStr,
+          challanNo:  String(row[3]  || '').trim(),
+          company:    String(row[4]  || '').trim(),
+          buyerName:  String(row[5]  || '').trim(),
+          buyerPhone: String(row[6]  || '').trim(),
+          buyerEmail: String(row[7]  || '').trim(),
+          subTotal:   parseFloat(row[8])  || 0,
+          taxAmount:  parseFloat(row[9])  || 0,
+          grandTotal: parseFloat(row[10]) || 0,
+          items:      String(row[16] || '[]').trim(), 
+          itemCount:  countItems(String(row[11] || '')),
+          username:   String(row[17] || '').trim()
+        });
+      }
+      return jsonOut({ invoices: invoices });
+    }
+
+    return jsonOut({ error: 'Unknown action: ' + action });
+  } catch (error) {
+    return jsonOut({ error: error.toString() });
+  }
+}
+
+// ─── POST ────────────────────────────────────────────────────────────────────
+function doPost(e) {
+  try {
+    var payload  = JSON.parse(e.postData.contents);
+    var action   = payload.action;
+    var username = payload.username || 'unknown';
+    // Fallback to support both nested `data` (Invoice) and flat payload (Challan)
+    var data     = payload.data || payload; 
+    var ss       = SpreadsheetApp.getActiveSpreadsheet();
+
+    setupSheets(ss);
+
+    // ── 1. SAVE INVOICE ───────────────────────────────────────────────────────
+    if (action === 'addInvoice') {
+      var sheet = ss.getSheetByName('Invoices');
+
+      // Duplicate Invoice No. check
+      if (sheet.getLastRow() > 0) {
+        var existingNos = sheet.getRange(1, 2, sheet.getLastRow(), 1).getValues();
+        for (var i = 0; i < existingNos.length; i++) {
+          if (String(existingNos[i][0]).trim() === String(data.invoiceNo).trim()) {
+            return jsonOut({ result: 'duplicate' });
+          }
+        }
+      }
+
+      var items = data.items || [];
+      var descriptions = items.map(function(it) { return it.desc || ''; }).join('; ');
+      var hsnCodes     = items.map(function(it) { return it.hsn  || ''; }).join('; ');
+      var quantities   = items.map(function(it) { return (it.qty || 0) + ' ' + (it.per || 'Nos'); }).join('; ');
+      var rates        = items.map(function(it) { return parseFloat(it.rate   || 0).toFixed(2); }).join('; ');
+      var itemAmounts  = items.map(function(it) { return parseFloat(it.amount || 0).toFixed(2); }).join('; ');
+      var itemsJson    = JSON.stringify(items);
+
+      sheet.appendRow([
+        new Date(),
+        data.invoiceNo,
+        data.date,
+        data.challanNo   || '',
+        data.companyName || '',
+        data.buyerName   || '',
+        data.buyerPhone  || '',
+        data.buyerEmail  || '',
+        parseFloat(data.subTotal)   || 0,
+        parseFloat(data.taxAmount)  || 0,
+        parseFloat(data.grandTotal) || 0,
+        descriptions,
+        hsnCodes,
+        quantities,
+        rates,
+        itemAmounts,
+        itemsJson,
+        username
+      ]);
+
+      // Auto-format numeric columns
+      var lastRow = sheet.getLastRow();
+      sheet.getRange(lastRow, 9, 1, 3).setNumberFormat('#,##0.00');
+
+      return jsonOut({ result: 'success' });
+    }
+
+    // ── 2. SAVE CHALLAN ───────────────────────────────────────────────────────
+    if (action === 'saveChallan') {
+      var sheet = ss.getSheetByName('Challans');
+
+      // Duplicate Challan No. check
+      if (sheet.getLastRow() > 0) {
+        var existingChallanNos = sheet.getRange(1, 2, sheet.getLastRow(), 1).getValues();
+        for (var j = 0; j < existingChallanNos.length; j++) {
+          if (String(existingChallanNos[j][0]).trim() === String(payload.id).trim()) {
+            return jsonOut({ result: 'duplicate', success: false });
+          }
+        }
+      }
+
+      sheet.appendRow([
+        new Date(),
+        payload.id,
+        payload.date,
+        payload.challanNo || '', // Ref Invoice No
+        payload.company || '',
+        payload.buyerName || '',
+        payload.buyerPhone || '',
+        payload.buyerEmail || '',
+        parseFloat(payload.subTotal) || 0,
+        parseFloat(payload.tax) || 0,
+        parseFloat(payload.grandTotal) || 0,
+        payload.itemDescriptions || '',
+        payload.hsnCodes || '',
+        payload.quantities || '',
+        payload.rates || '',
+        payload.itemAmounts || '',
+        payload.itemsJson || '[]',
+        username
+      ]);
+
+      // Auto-format numeric columns
+      var lastRow = sheet.getLastRow();
+      sheet.getRange(lastRow, 9, 1, 3).setNumberFormat('#,##0.00');
+
+      return jsonOut({ result: 'success', success: true });
+    }
+
+    // ── 3. SAVE / UPSERT BUYER ────────────────────────────────────────────────
+    if (action === 'addBuyer' || action === 'saveBuyer') {
+      var sheet = ss.getSheetByName('Buyers');
+      var buyerName = (data.name || '').trim();
+      var upserted  = false;
+
+      if (sheet.getLastRow() > 1) {
+        var existingNames = sheet.getRange(2, 2, sheet.getLastRow() - 1, 1).getValues();
+        for (var k = 0; k < existingNames.length; k++) {
+          if (String(existingNames[k][0]).trim().toLowerCase() === buyerName.toLowerCase()) {
+            sheet.getRange(k + 2, 1, 1, 9).setValues([[
+              new Date(),
+              data.name      || '',
+              data.address   || '',
+              data.gstin     || '',
+              data.state     || '',
+              data.stateCode || '',
+              data.phone     || '',
+              data.email     || '',
+              username
+            ]]);
+            upserted = true;
+            break;
+          }
+        }
+      }
+
+      if (!upserted) {
+        sheet.appendRow([
+          new Date(),
+          data.name      || '',
+          data.address   || '',
+          data.gstin     || '',
+          data.state     || '',
+          data.stateCode || '',
+          data.phone     || '',
+          data.email     || '',
+          username
+        ]);
+      }
+      return jsonOut({ result: 'success', success: true });
+    }
+
+    return jsonOut({ result: 'error', message: 'Unknown POST action: ' + action });
+  } catch (error) {
+    return jsonOut({ result: 'error', message: error.toString() });
+  }
+}
+
+// ─── HELPERS ──────────────────────────────────────────────────────────────────
+
+function jsonOut(obj) {
+  return ContentService
+    .createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+function countItems(descriptionsStr) {
+  if (!descriptionsStr || descriptionsStr.trim() === '') return 0;
+  return descriptionsStr.split(';').filter(function(s) { return s.trim() !== ''; }).length;
+}
+
+// ─── SETUP AUTOMATION ─────────────────────────────────────────────────────────
+
+function setupSheets(ss) {
+  if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  // ── Users ──
+  if (!ss.getSheetByName('Users')) {
+    var u = ss.insertSheet('Users');
+    u.appendRow(['Username', 'Password', 'Full Name', 'Created Date']);
+    u.getRange('A1:D1').setFontWeight('bold').setBackground('#f3f4f6');
+    u.setFrozenRows(1);
+    u.setColumnWidths(1, 4, 160);
+    u.appendRow(['admin', 'admin123', 'Administrator', new Date()]);
+  }
+
+  // ── Invoices ──
+  if (!ss.getSheetByName('Invoices')) {
+    var inv = ss.insertSheet('Invoices');
+    inv.appendRow([
+      'Timestamp', 'Invoice No', 'Date', 'Challan No', 'Company', 'Buyer',
+      'Buyer Phone', 'Buyer Email', 'Sub Total', 'Tax', 'Grand Total',
+      'Item Descriptions', 'HSN Codes', 'Quantities', 'Rates',
+      'Item Amounts', 'Items (JSON)', 'Saved By (Username)'
+    ]);
+    inv.getRange('A1:R1').setFontWeight('bold').setBackground('#f3f4f6');
+    inv.setFrozenRows(1);
+  }
+
+  // ── Challans ──
+  if (!ss.getSheetByName('Challans')) {
+    var chal = ss.insertSheet('Challans');
+    chal.appendRow([
+      'Timestamp', 'Challan No', 'Date', 'Ref Invoice No', 'Company', 'Buyer',
+      'Buyer Phone', 'Buyer Email', 'Sub Total', 'Tax', 'Grand Total',
+      'Item Descriptions', 'HSN Codes', 'Quantities', 'Rates',
+      'Item Amounts', 'Items (JSON)', 'Saved By (Username)'
+    ]);
+    chal.getRange('A1:R1').setFontWeight('bold').setBackground('#fffbeb');
+    chal.setFrozenRows(1);
+  }
+
+  // ── Buyers ──
+  if (!ss.getSheetByName('Buyers')) {
+    var b = ss.insertSheet('Buyers');
+    b.appendRow([
+      'Timestamp', 'Buyer Name', 'Address', 'GSTIN',
+      'State', 'State Code', 'Phone', 'Email', 'Saved By (Username)'
+    ]);
+    b.getRange('A1:I1').setFontWeight('bold').setBackground('#f3f4f6');
+    b.setFrozenRows(1);
+  }
+}
